@@ -1,5 +1,5 @@
 import base64
-import gzip
+import gzip, time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
@@ -60,13 +60,25 @@ def sinusoids(length, channels, max_timescale=10000):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_state: int, n_head: int):
+    def __init__(self, n_state: int, n_head: int, is_encoder: bool = False):
         super().__init__()
         self.n_head = n_head
         self.query = Linear(n_state, n_state)
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
+        self.is_encoder = is_encoder
+        self.max_seq_len = 1500
+        self.n_state = n_state
+        if self.is_encoder:
+            self.reset()
+
+    def reset(self):
+        # should obey the config device.
+        self.k_cache = torch.zeros(0, self.n_state).to('cuda').to(torch.float16)
+        self.v_cache = torch.zeros(0, self.n_state).to('cuda').to(torch.float16)
+        self.current_length = 0
+
 
     def forward(
         self,
@@ -74,9 +86,33 @@ class MultiHeadAttention(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        stream: bool = False,
     ):
-        q = self.query(x)
 
+        if self.is_encoder and stream:
+            B, T, C = x.shape
+            scale = (self.n_state // self.n_head) ** -0.25
+            q = self.query(x) * scale
+            k = self.key(x) * scale
+            v = self.value(x)
+            if self.current_length < self.max_seq_len:
+                self.k_cache = torch.cat((self.k_cache, k[0]), dim=0)
+                self.v_cache = torch.cat((self.v_cache, v[0]), dim=0)
+                self.current_length += 100
+            else:
+                self.k_cache = torch.roll(self.k_cache, shifts=-1, dims=0)
+                self.v_cache = torch.roll(self.v_cache, shifts=-1, dims=0)
+            q = q.view(B, T, self.n_head, -1).transpose(1, 2)
+            k = self.k_cache[:self.current_length].view(B, self.current_length, self.n_head, -1).transpose(1, 2)
+            v = self.v_cache[:self.current_length].view(B, self.current_length, self.n_head, -1).transpose(1, 2)
+
+            x  = torch.matmul(q, k.transpose(-2, -1)).to(q.dtype)
+            x = (F.softmax(x, dim=-1) @ v).to(q.dtype)
+            x = x.transpose(1, 2).contiguous().view(B, -1, C)
+            x = self.out(x)
+            return x, None
+
+        q = self.query(x)
         if kv_cache is None or xa is None or self.key not in kv_cache:
             # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
             # otherwise, perform key/value projections for self- or cross-attention as usual.
@@ -109,10 +145,10 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False, is_encoder: bool = False):
         super().__init__()
 
-        self.attn = MultiHeadAttention(n_state, n_head)
+        self.attn = MultiHeadAttention(n_state, n_head, is_encoder=is_encoder)
         self.attn_ln = LayerNorm(n_state)
 
         self.cross_attn = (
@@ -132,8 +168,9 @@ class ResidualAttentionBlock(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        stream: bool = False
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache, stream=stream)[0]
         if self.cross_attn:
             x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(self.mlp_ln(x))
@@ -148,28 +185,62 @@ class AudioEncoder(nn.Module):
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
+        self.max_step = 15
+        self.n_state = n_state
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
+            [ResidualAttentionBlock(n_state, n_head, is_encoder=True) for _ in range(n_layer)]
         )
         self.ln_post = LayerNorm(n_state)
+        self.reset_states()
 
-    def forward(self, x: Tensor):
+    def reset_states(self):
+        self.state_c1 = None
+        self.state_c2 = torch.zeros(1, self.n_state, 1).to(torch.float16).to('cuda')
+        [block.attn.reset() for block in self.blocks]
+
+    def causal_conv1(self, x: Tensor, step: int) :
+        if step > 0:
+            if step == self.max_step - 1:
+                x = F.pad(x, (0, 1))
+            out = F.conv1d(x, self.conv1.weight.data.to(x.dtype), bias=self.conv1.bias.data.to(x.dtype))[:,:,1:]
+        else:
+            x = F.pad(x, (1,0))
+            out = F.conv1d(x, self.conv1.weight.data.to(x.dtype), bias=self.conv1.bias.data.to(x.dtype))
+        return F.gelu(out)
+
+    def causal_conv2(self, x: Tensor, step: int) :
+        if step == self.max_step - 1:
+            x = F.pad(x, (0, 1))
+        out = F.conv1d(x, self.conv2.weight.data.to(x.dtype), bias=self.conv2.bias.data.to(x.dtype), stride=2)
+        return F.gelu(out)
+
+    def forward(self, x: Tensor, stream: bool = False, step: int = None):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
+        if stream is False:
+            x = F.gelu(self.conv1(x))
+            x = F.gelu(self.conv2(x))
+            pos = self.positional_embedding
+        else:
+            self.state_c2.to(x.device).to(x.dtype)
+            if step == 0:
+                c1 = self.causal_conv1(x, step)
+            else:
+                c1 = self.causal_conv1(torch.cat((self.state_c1, x), dim=-1), step)
+            self.state_c1 = x[:,:,-3:-1]
+            self.state_c2 = c1[:,:,-1:]
+            x = self.causal_conv2(torch.cat((self.state_c2, c1), dim=-1), step)
+            pos = self.positional_embedding[step * 100:step * 100 + 100]
+
         x = x.permute(0, 2, 1)
-
-        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-        x = (x + self.positional_embedding).to(x.dtype)
-
+        x = (x + pos).to(x.dtype)
         for block in self.blocks:
-            x = block(x)
-
+            x = block(x, stream=stream)
         x = self.ln_post(x)
+
         return x
 
 
