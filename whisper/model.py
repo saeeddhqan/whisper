@@ -81,13 +81,26 @@ def disable_sdpa():
 class MultiHeadAttention(nn.Module):
     use_sdpa = True
 
-    def __init__(self, n_state: int, n_head: int):
+    def __init__(self, n_state: int, n_head: int, is_encoder: bool = False):
         super().__init__()
         self.n_head = n_head
         self.query = Linear(n_state, n_state)
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
+        self.is_encoder = is_encoder
+        self.n_state = n_state
+        self.max_seq_len = 1500
+
+        if self.is_encoder:
+            self.reset()
+
+
+    def reset(self):
+        self.keysx = torch.zeros(0, self.n_state).to('cuda').to(torch.float16)
+        self.valuesx = torch.zeros(0, self.n_state).to('cuda').to(torch.float16)
+        self.current_length = 0
+
 
     def forward(
         self,
@@ -95,7 +108,38 @@ class MultiHeadAttention(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        stream: bool = False,
+        samples: int = -1,
+        last_step: bool = False,
     ):
+
+        if self.is_encoder and stream:
+            B, T, C = x.shape
+            scale = (self.n_state // self.n_head) ** -0.25
+            q = self.query(x)
+            k = self.key(x)
+            v = self.value(x)
+            if self.current_length < self.max_seq_len:
+                self.keysx = torch.cat((self.keysx, k[0]), dim=0)
+                self.valuesx = torch.cat((self.valuesx, v[0]), dim=0)
+                self.current_length += samples
+            else:
+                self.keysx = torch.roll(self.keysx, shifts=-1, dims=0)
+                self.valuesx = torch.roll(self.valuesx, shifts=-1, dims=0)
+            q = q.view(B, T, self.n_head, -1).transpose(1, 2)
+            k = self.keysx[:self.current_length].view(B, self.current_length, self.n_head, -1).transpose(1, 2)
+            v = self.valuesx[:self.current_length].view(B, self.current_length, self.n_head, -1).transpose(1, 2)
+            # if last_step:
+                # print(q.shape, k.shape, v.shape)
+            x = F.scaled_dot_product_attention(q, k, v)
+            # x  = torch.matmul(q, k.transpose(-2, -1)).to(q.dtype)
+            # x = (F.softmax(x, dim=-1) @ v).to(q.dtype)
+
+            x = x.transpose(1, 2).contiguous().view(B, -1, C)
+            x = self.out(x)
+
+            return x, None
+
         q = self.query(x)
 
         if kv_cache is None or xa is None or self.key not in kv_cache:
@@ -140,10 +184,10 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False, is_encoder: bool = False):
         super().__init__()
 
-        self.attn = MultiHeadAttention(n_state, n_head)
+        self.attn = MultiHeadAttention(n_state, n_head, is_encoder=is_encoder)
         self.attn_ln = LayerNorm(n_state)
 
         self.cross_attn = (
@@ -163,8 +207,11 @@ class ResidualAttentionBlock(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        stream: bool = False,
+        samples: int = -1,
+        last_step: bool = False,
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache, stream=stream, samples=samples, last_step=last_step)[0]
         if self.cross_attn:
             x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(self.mlp_ln(x))
@@ -179,29 +226,76 @@ class AudioEncoder(nn.Module):
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
+        self.max_step = -1
+        self.n_state = n_state
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
+            [ResidualAttentionBlock(n_state, n_head, is_encoder=True) for _ in range(n_layer)]
         )
+        self.reset_states()
         self.ln_post = LayerNorm(n_state)
 
-    def forward(self, x: Tensor):
+
+    def reset_states(self):
+        self.state_c1 = None
+        self.state_c2 = torch.zeros(1, self.n_state, 1).to(torch.float16).to('cuda')
+        [block.attn.reset() for block in self.blocks]
+
+
+    def causal_conv1(self, x, step):
+        if step > 0:
+            if step == self.max_step - 1:
+                x = F.pad(x, (0, 1))
+            out = F.conv1d(x, self.conv1.weight.data.to(x.dtype), bias=self.conv1.bias.data.to(x.dtype))[:,:,1:]
+        else:
+            x = F.pad(x, (1,0))
+            out = F.conv1d(x, self.conv1.weight.data.to(x.dtype), bias=self.conv1.bias.data.to(x.dtype))
+        return F.gelu(out)
+
+
+    def causal_conv2(self, x,  step):
+        if step == self.max_step - 1:
+            x = F.pad(x, (0, 1))
+        out = F.conv1d(x, self.conv2.weight.data.to(x.dtype), bias=self.conv2.bias.data.to(x.dtype), stride=2)
+        return F.gelu(out)
+
+
+    def forward(self, x: Tensor, streaming: bool = False, step: int = -1, samples: int = -1):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
-        x = x.permute(0, 2, 1)
+        if streaming is False:
+            x = F.gelu(self.conv1(x))
+            x = F.gelu(self.conv2(x))
+            x = x.permute(0, 2, 1)
 
-        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-        x = (x + self.positional_embedding).to(x.dtype)
+            assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+            x = (x + self.positional_embedding).to(x.dtype)
 
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.ln_post(x)
-        return x
+            for block in self.blocks:
+                x = block(x)
+        else:
+            if step >= 0:
+                if step == 0:
+                    c1 = self.causal_conv1(x, step)
+                else:
+                    c1 = self.causal_conv1(torch.cat((self.state_c1, x), dim=-1), step)
+                self.state_c1 = x[:,:,-3:-1]
+                x = self.causal_conv2(torch.cat((self.state_c2, c1), dim=-1), step)
+                x = x.permute(0, 2, 1)
+                self.state_c2 = c1[:,:,-1:]
+                x = (x + self.positional_embedding[step * samples:(step * samples) + samples]).to(x.dtype)
+                for block in self.blocks:
+                    x = block(x, stream=True, samples=samples)
+            else:
+                c1 = self.causal_conv1(torch.cat((self.state_c1, x), dim=-1), step)
+                x = self.causal_conv2(torch.cat((self.state_c2, c1), dim=-1), step)
+                x = x.permute(0, 2, 1)
+                x = (x + self.positional_embedding[-samples:]).to(x.dtype)
+                for block in self.blocks:
+                    x = block(x, stream=True, samples=samples, last_step=True)
+        return self.ln_post(x)
 
 
 class TextDecoder(nn.Module):
